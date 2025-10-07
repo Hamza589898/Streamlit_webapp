@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
+import matplotlib.pyplot as plt
 import io
 import csv
 from datetime import datetime
@@ -8,29 +10,21 @@ import numpy as np
 import traceback
 import warnings
 import sys
+import base64
 
-# Suppress warnings
 warnings.filterwarnings('ignore')
 
-# Page configuration
 st.set_page_config(
     page_title="Finance Automation",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS styling
 st.markdown("""
 <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
-    
-    [data-testid="column"]:first-child {
-        background-color: #f3f4f6;
-        padding: 25px;
-        border-radius: 8px;
-    }
     
     .section-header {
         font-size: 18px;
@@ -71,43 +65,13 @@ st.markdown("""
         background-color: #10b981;
         color: white;
     }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        font-size: 18px;
-        font-weight: 600;
-        padding: 12px 24px;
-    }
-    
-    [data-testid="stFileUploader"] section div {
-        display: none;
-    }
-    
-    [data-testid="stFileUploader"] section {
-        padding: 0;
-    }
-    
-    .uploadedFile {
-        margin-top: 10px;
-    }
-    
-    .empty-state {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        height: 400px;
-        color: #6b7280;
-        font-size: 16px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
+if 'captured_figures' not in st.session_state:
+    st.session_state.captured_figures = []
 if 'console_logs' not in st.session_state:
     st.session_state.console_logs = []
 if 'error_logs' not in st.session_state:
@@ -120,7 +84,6 @@ if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
 
 def log_to_console(message, msg_type='info'):
-    """Add messages to console log"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     icon = {'info': 'INFO', 'success': 'SUCCESS', 'error': 'ERROR', 'warning': 'WARNING'}.get(msg_type, 'INFO')
     st.session_state.console_logs.append(f"[{timestamp}] [{icon}] {message}")
@@ -128,7 +91,6 @@ def log_to_console(message, msg_type='info'):
         st.session_state.console_logs = st.session_state.console_logs[-100:]
 
 def log_error(error_msg, traceback_str=None):
-    """Add error to error console"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     error_entry = f"[{timestamp}] ERROR: {error_msg}"
     if traceback_str:
@@ -139,7 +101,6 @@ def log_error(error_msg, traceback_str=None):
 
 @st.cache_data(show_spinner=False)
 def process_uploaded_file(file_bytes, file_name):
-    """Process uploaded CSV or Excel file - cached for performance"""
     try:
         if file_name.endswith('.csv'):
             try:
@@ -163,7 +124,6 @@ def process_uploaded_file(file_bytes, file_name):
         return None
 
 def combine_uploaded_files(uploaded_files):
-    """Combine multiple uploaded files into one dataframe"""
     try:
         if not uploaded_files:
             return None
@@ -196,7 +156,6 @@ def combine_uploaded_files(uploaded_files):
         return None
 
 class PrintCapture:
-    """Capture print statements"""
     def __init__(self, log_func):
         self.log_func = log_func
         self.original_stdout = sys.stdout
@@ -208,15 +167,48 @@ class PrintCapture:
     def flush(self):
         pass
 
+class FigureCapture:
+    def __init__(self):
+        self.figures = []
+        self.original_plt_show = None
+    
+    def capture_matplotlib(self):
+        try:
+            fig = plt.gcf()
+            if fig.get_axes():
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+                buf.seek(0)
+                img_str = base64.b64encode(buf.read()).decode()
+                self.figures.append(('matplotlib', img_str))
+                log_to_console(f"Captured matplotlib figure", 'success')
+                plt.close(fig)
+        except Exception as e:
+            log_error(f"Error capturing matplotlib figure: {str(e)}")
+    
+    def capture_plotly(self, fig):
+        try:
+            self.figures.append(('plotly', fig))
+            log_to_console(f"Captured plotly figure", 'success')
+        except Exception as e:
+            log_error(f"Error capturing plotly figure: {str(e)}")
+
 def execute_python_script(df, script):
-    """Execute Python script on dataframe with better error handling"""
     try:
         log_to_console("=" * 50, 'info')
         log_to_console("Starting script execution...", 'info')
         log_to_console(f"Input data: {len(df)} rows × {len(df.columns)} columns", 'info')
         log_to_console("=" * 50, 'info')
         
-        # Create execution environment
+        fig_capture = FigureCapture()
+        
+        def custom_plt_show(*args, **kwargs):
+            fig_capture.capture_matplotlib()
+        
+        original_plotly_show = go.Figure.show
+        def custom_plotly_show(self, *args, **kwargs):
+            fig_capture.capture_plotly(self)
+        
         exec_globals = {
             'input_df': df.copy(),
             'pd': pd,
@@ -224,22 +216,33 @@ def execute_python_script(df, script):
             'datetime': datetime,
             'io': io,
             'csv': csv,
+            'plt': plt,
+            'go': go,
+            'px': px,
+            'matplotlib': plt,
         }
         
         exec_locals = {}
         
-        # Redirect stdout to capture print statements
         old_stdout = sys.stdout
         sys.stdout = PrintCapture(log_to_console)
         
-        try:
-            # Execute the script
-            exec(script, exec_globals, exec_locals)
-        finally:
-            # Restore stdout
-            sys.stdout = old_stdout
+        original_plt_show = plt.show
+        plt.show = custom_plt_show
         
-        # Check for output
+        go.Figure.show = custom_plotly_show
+        
+        try:
+            exec(script, exec_globals, exec_locals)
+            
+            if plt.get_fignums():
+                fig_capture.capture_matplotlib()
+            
+        finally:
+            sys.stdout = old_stdout
+            plt.show = original_plt_show
+            go.Figure.show = original_plotly_show
+        
         output_df = None
         
         if 'output_df' in exec_locals:
@@ -251,99 +254,41 @@ def execute_python_script(df, script):
             error_msg = "Script must define 'output_df' variable"
             log_to_console(error_msg, 'error')
             log_error(error_msg, "No output_df found after script execution")
-            return None
+            return None, []
         
         if not isinstance(output_df, pd.DataFrame):
             error_msg = f"output_df must be a DataFrame, got {type(output_df)}"
             log_to_console(error_msg, 'error')
             log_error(error_msg)
-            return None
+            return None, []
         
         log_to_console("=" * 50, 'success')
         log_to_console(f"Output generated: {len(output_df)} rows × {len(output_df.columns)} columns", 'success')
+        if fig_capture.figures:
+            log_to_console(f"Captured {len(fig_capture.figures)} visualization(s)", 'success')
         log_to_console("=" * 50, 'success')
         
-        return output_df
+        return output_df, fig_capture.figures
             
     except SyntaxError as e:
         error_msg = f"Syntax Error on line {e.lineno}: {str(e)}"
         log_to_console(error_msg, 'error')
         log_error(error_msg, traceback.format_exc())
-        return None
+        return None, []
     except NameError as e:
         error_msg = f"Name Error: {str(e)}"
         log_to_console(error_msg, 'error')
         log_error(error_msg, traceback.format_exc())
-        return None
+        return None, []
     except Exception as e:
         error_msg = f"Execution failed: {str(e)}"
         log_to_console(error_msg, 'error')
         log_error(error_msg, traceback.format_exc())
-        return None
+        return None, []
     finally:
         sys.stdout = old_stdout
+        plt.close('all')
 
-def create_dynamic_chart(df):
-    """Create interactive chart from dataframe"""
-    if df is None or len(df) == 0:
-        return None
-    
-    try:
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numeric_cols:
-            return None
-        
-        date_cols = [col for col in df.columns if any(term in col.lower() 
-                     for term in ['date', 'time', 'timestamp', 'day', 'month', 'year'])]
-        
-        if date_cols:
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    x_data = pd.to_datetime(df[date_cols[0]], errors='coerce')
-                
-                if x_data.isna().all():
-                    x_data = list(range(len(df)))
-                    x_label = 'Row Index'
-                else:
-                    x_label = date_cols[0]
-            except:
-                x_data = list(range(len(df)))
-                x_label = 'Row Index'
-        else:
-            x_data = list(range(len(df)))
-            x_label = 'Row Index'
-        
-        fig = go.Figure()
-        colors = ['#f59e0b', '#10b981', '#3b82f6', '#dc2626', '#6366f1']
-        plot_limit = min(len(df), 100)
-        
-        for idx, col in enumerate(numeric_cols[:3]):
-            fig.add_trace(go.Scatter(
-                x=x_data[:plot_limit] if not isinstance(x_data, list) else x_data[:plot_limit],
-                y=df[col][:plot_limit],
-                mode='lines+markers',
-                name=col.capitalize(),
-                line=dict(color=colors[idx], width=2),
-                marker=dict(size=6)
-            ))
-        
-        fig.update_layout(
-            title='Output Data Visualization',
-            xaxis_title=x_label,
-            yaxis_title='Value',
-            height=400,
-            hovermode='x unified',
-            template='plotly_white',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        
-        return fig
-    except Exception as e:
-        log_error(f"Chart error: {str(e)}", traceback.format_exc())
-        return None
-
-# Main Layout
 st.title("Finance Automation")
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -393,6 +338,7 @@ with left_col:
         if st.session_state.combined_data is not None:
             st.session_state.combined_data = None
             st.session_state.processed_data = None
+            st.session_state.captured_figures = []
             st.session_state.script_executed = False
             st.session_state.current_file_names = []
     
@@ -400,29 +346,15 @@ with left_col:
     
     st.markdown('<p class="section-header">Python Script</p>', unsafe_allow_html=True)
     
-    default_script = """# Copy input data
-df = input_df.copy()
-
-# Show what we have
-print(f"Input shape: {df.shape}")
-print(f"Columns: {list(df.columns)}")
-
-# Basic transformation
-if len(df) > 0:
-    # Add row number
-    df['row_number'] = range(1, len(df) + 1)
-    print(f"Added row_number column")
-
-# REQUIRED: Set output
-output_df = df
-print("Script completed successfully!")"""
+    default_script = ""
     
     code_editor = st.text_area(
         "Python Script",
         value=default_script,
-        height=300,
-        help="Script must define 'output_df' variable. Available: input_df, pd, np, datetime",
-        label_visibility="collapsed"
+        height=400,
+        help="Write Python code. Use plt.show() or fig.show() to display charts",
+        label_visibility="collapsed",
+        placeholder="# Write your Python code here\n# Your data is available as 'input_df'\n# Set 'output_df' to define the output"
     )
     
     col1, col2 = st.columns(2)
@@ -434,12 +366,14 @@ print("Script completed successfully!")"""
                 st.session_state.console_logs = []
                 st.session_state.error_logs = []
                 st.session_state.processed_data = None
+                st.session_state.captured_figures = []
                 st.session_state.script_executed = False
                 
                 with st.spinner('Executing...'):
-                    result = execute_python_script(st.session_state.combined_data, code_editor)
+                    result, figures = execute_python_script(st.session_state.combined_data, code_editor)
                     if result is not None:
                         st.session_state.processed_data = result
+                        st.session_state.captured_figures = figures
                         st.session_state.script_executed = True
                 st.rerun()
     
@@ -489,20 +423,31 @@ with right_col:
         tab1, tab2, tab3 = st.tabs(["Output", "Execution Log", "Error Details"])
         
         with tab1:
-            st.markdown("### Output Visualization")
-            
-            chart = create_dynamic_chart(st.session_state.processed_data)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
+            if st.session_state.captured_figures:
+                st.markdown("### Visualizations")
+                st.markdown(f"*{len(st.session_state.captured_figures)} chart(s) generated*")
+                st.markdown("")
+                
+                for idx, (fig_type, fig_data) in enumerate(st.session_state.captured_figures):
+                    if fig_type == 'matplotlib':
+                        st.image(f"data:image/png;base64,{fig_data}", use_container_width=True)
+                    elif fig_type == 'plotly':
+                        st.plotly_chart(fig_data, use_container_width=True)
+                    
+                    if idx < len(st.session_state.captured_figures) - 1:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                
+                st.markdown("---")
+                st.markdown("")
             else:
-                st.info("No numeric columns available for visualization")
-            
-            st.markdown("---")
+                st.info("No visualizations. Add plt.show() or fig.show() to your script.")
+                st.markdown("---")
             
             st.markdown("### Data Preview")
             preview_rows = st.slider("Preview rows:", 5, 50, 10, key="preview_slider")
             st.dataframe(st.session_state.processed_data.head(preview_rows), use_container_width=True)
             
+            st.markdown("")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Total Rows", len(st.session_state.processed_data))
@@ -530,4 +475,4 @@ with right_col:
             else:
                 st.success("No errors detected")
     else:
-        st.markdown('<div class="empty-state">Upload files and run script to see output</div>', unsafe_allow_html=True)
+        st.markdown('<div style="display: flex; align-items: center; justify-content: center; height: 400px; color: #6b7280; font-size: 16px;">Upload files and run script to see output</div>', unsafe_allow_html=True)
